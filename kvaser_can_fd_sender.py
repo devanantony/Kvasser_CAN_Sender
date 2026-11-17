@@ -2,6 +2,12 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import can
+
+# Explicit imports: PyInstaller may not detect python-can's dynamically
+# loaded Kvaser backend when building the executable.
+import can.interfaces.kvaser
+import can.interfaces.kvaser.canlib
+
 import threading
 import time
 from datetime import datetime
