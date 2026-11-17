@@ -285,56 +285,28 @@ class KvaserCanSender:
     def connect(self):
 
         try:
-
             bitrate = int(self.bitrate.get())
 
-            fd_enabled = self.can_fd.get()
-
-            config = {
-                "interface": "kvaser",
-                "channel": 0,
-                "bitrate": bitrate
-            }
-
-            if fd_enabled:
-                config["fd"] = True
-                config["data_bitrate"] = int(
-                    self.data_bitrate.get()
-                )
-
-            self.bus = can.Bus(**config)
+            self.bus = can.Bus(
+                interface="kvaser",
+                channel=0,
+                bitrate=bitrate
+            )
 
             self.status.config(
-                text="Connected",
+                text="Connected - Classic CAN",
                 foreground="green"
             )
 
-            self.connect_button.config(
-                state="disabled"
-            )
+            self.connect_button.config(state="disabled")
+            self.disconnect_button.config(state="normal")
 
-            self.disconnect_button.config(
-                state="normal"
-            )
-
-            self.send_button.config(
-                state="normal"
-            )
-
-            self.start_button.config(
-                state="normal"
-            )
+            self.send_button.config(state="normal")
+            self.start_button.config(state="normal")
 
             self.write_log(
-                f"Kvaser connected. "
-                f"Nominal bitrate={bitrate}"
+                f"Kvaser connected successfully at {bitrate} bps"
             )
-
-            if fd_enabled:
-                self.write_log(
-                    f"CAN FD enabled. Data bitrate="
-                    f"{self.data_bitrate.get()}"
-                )
 
         except Exception as e:
 
@@ -408,7 +380,7 @@ class KvaserCanSender:
                 arbitration_id=can_id,
                 data=data,
                 is_extended_id=self.extended.get(),
-                is_fd=fd_enabled
+                is_fd=False
             )
 
         except Exception as e:
