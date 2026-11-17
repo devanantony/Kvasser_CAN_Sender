@@ -344,26 +344,29 @@ class KvaserDualChannelSender:
             return [0, 1]
         return [requested_channel]
 
-    def transmit(self, requested_channel, msg):
-        targets = self.targets_for(requested_channel)
-        if any(self.channel_cfg[ch].bus is None for ch in targets):
-            raise RuntimeError("One or more target channels are not connected")
+    def transmit_one(self, ch, msg):
+        """Transmit on one CAN channel without waiting for the other channel."""
+        bus = self.channel_cfg[ch].bus
+        if bus is None:
+            self.log_message(f"TX ERROR CH{ch}: channel is not connected")
+            return
+        try:
+            bus.send(msg, timeout=1.0)
+            self.log_message(
+                f"TX CH{ch}: ID=0x{msg.arbitration_id:X} "
+                f"Extended={msg.is_extended_id} FD={msg.is_fd} "
+                f"BRS={msg.bitrate_switch} DLC={msg.dlc} "
+                f"DATA={msg.data.hex(' ').upper()}"
+            )
+        except Exception as exc:
+            self.log_message(f"TX ERROR CH{ch}: {type(exc).__name__}: {exc}")
 
-        errors = []
-        for ch in targets:
-            try:
-                self.channel_cfg[ch].bus.send(msg, timeout=1.0)
-                self.log_message(
-                    f"TX CH{ch}: ID=0x{msg.arbitration_id:X} "
-                    f"Extended={msg.is_extended_id} FD={msg.is_fd} "
-                    f"BRS={msg.bitrate_switch} DLC={msg.dlc} "
-                    f"DATA={msg.data.hex(' ').upper()}"
-                )
-            except Exception as exc:
-                errors.append(f"CH{ch}: {exc}")
-                self.log_message(f"TX ERROR CH{ch}: {exc}")
-        if errors:
-            raise RuntimeError("; ".join(errors))
+    def transmit(self, requested_channel, msg):
+        """Launch a separate one-shot TX task for each target channel."""
+        for ch in self.targets_for(requested_channel):
+            threading.Thread(
+                target=self.transmit_one, args=(ch, msg), daemon=True
+            ).start()
 
     def send_message(self, requested_channel):
         if not self.connected:
@@ -378,62 +381,108 @@ class KvaserDualChannelSender:
     def start_periodic(self, requested_channel):
         if not self.connected:
             return
-        if self.broadcast_same.get() and requested_channel == 1:
+
+        targets = self.targets_for(requested_channel)
+        if any(self.channel_cfg[ch].running for ch in targets):
             return
 
-        cfg = self.channel_cfg[requested_channel]
-        if cfg.running:
-            return
-
+        source_channel = 0 if self.broadcast_same.get() else requested_channel
+        source_cfg = self.channel_cfg[source_channel]
         try:
-            interval = float(cfg.interval.get()) / 1000.0
+            interval = float(source_cfg.interval.get()) / 1000.0
             if interval <= 0:
                 raise ValueError("Interval must be greater than zero")
-            msg = self.build_message(0 if self.broadcast_same.get() else requested_channel)
+            msg = self.build_message(source_channel)
         except Exception as exc:
             messagebox.showerror("Periodic TX configuration error", str(exc))
             return
 
-        cfg.running = True
-        cfg.start_button.configure(state="disabled")
-        cfg.stop_button.configure(state="normal")
-        cfg.thread = threading.Thread(
-            target=self.periodic_worker,
-            args=(requested_channel, msg, interval),
-            daemon=True
-        )
-        cfg.thread.start()
-        targets = self.targets_for(requested_channel)
-        self.log_message(
-            f"Periodic TX started for CH{','.join(map(str, targets))}: "
-            f"{interval * 1000:.1f} ms"
-        )
+        # Each physical channel has its own scheduler and TX worker.
+        for ch in targets:
+            cfg = self.channel_cfg[ch]
+            cfg.running = True
+            cfg.thread = threading.Thread(
+                target=self.periodic_worker,
+                args=(ch, msg, interval),
+                daemon=True
+            )
+            cfg.thread.start()
 
-    def periodic_worker(self, requested_channel, msg, interval):
+        if self.broadcast_same.get():
+            self.channel_cfg[0].start_button.configure(state="disabled")
+            self.channel_cfg[0].stop_button.configure(state="normal")
+            self.channel_cfg[1].start_button.configure(state="disabled")
+            self.channel_cfg[1].stop_button.configure(state="disabled")
+            self.log_message(
+                f"Parallel broadcast started: CH0 and CH1 independently, "
+                f"period={interval * 1000:.1f} ms"
+            )
+        else:
+            cfg = self.channel_cfg[requested_channel]
+            cfg.start_button.configure(state="disabled")
+            cfg.stop_button.configure(state="normal")
+            self.log_message(
+                f"Periodic TX started on CH{requested_channel}: "
+                f"{interval * 1000:.1f} ms"
+            )
+
+    def periodic_worker(self, ch, msg, interval):
+        cfg = self.channel_cfg[ch]
         next_tx = time.monotonic()
-        cfg = self.channel_cfg[requested_channel]
         while cfg.running:
             try:
-                self.transmit(requested_channel, msg)
+                # This worker sends only through its own channel handle.
+                cfg.bus.send(msg, timeout=1.0)
+                self.log_message(
+                    f"TX CH{ch}: ID=0x{msg.arbitration_id:X} "
+                    f"Extended={msg.is_extended_id} FD={msg.is_fd} "
+                    f"BRS={msg.bitrate_switch} DLC={msg.dlc} "
+                    f"DATA={msg.data.hex(' ').upper()}"
+                )
             except Exception as exc:
-                self.log_message(f"Periodic TX stopped: {exc}")
+                cfg.running = False
+                self.log_message(
+                    f"TX ERROR CH{ch}: {type(exc).__name__}: {exc}. "
+                    f"Stopped periodic TX on CH{ch} only."
+                )
                 break
+
             next_tx += interval
             time.sleep(max(0, next_tx - time.monotonic()))
-        self.root.after(0, lambda c=requested_channel: self.periodic_finished(c))
+
+        self.root.after(0, lambda c=ch: self.periodic_finished(c))
 
     def stop_periodic(self, ch):
-        cfg = self.channel_cfg[ch]
-        cfg.running = False
-        cfg.stop_button.configure(state="disabled")
-        self.log_message(f"Periodic TX stop requested for CH{ch}")
+        if self.broadcast_same.get() and ch == 0:
+            for channel in (0, 1):
+                self.channel_cfg[channel].running = False
+            self.log_message("Stop requested for broadcast on CH0 and CH1")
+        else:
+            self.channel_cfg[ch].running = False
+            self.log_message(f"Periodic TX stop requested for CH{ch}")
+        self.channel_cfg[ch].stop_button.configure(state="disabled")
 
     def periodic_finished(self, ch):
         cfg = self.channel_cfg[ch]
         cfg.running = False
-        cfg.stop_button.configure(state="disabled")
-        can_start = self.connected and not (self.broadcast_same.get() and ch == 1)
-        cfg.start_button.configure(state="normal" if can_start else "disabled")
+
+        if self.broadcast_same.get():
+            any_running = any(self.channel_cfg[c].running for c in (0, 1))
+            self.channel_cfg[0].start_button.configure(
+                state="disabled" if any_running or not self.connected else "normal"
+            )
+            self.channel_cfg[0].stop_button.configure(
+                state="normal" if any_running else "disabled"
+            )
+            self.channel_cfg[1].start_button.configure(state="disabled")
+            self.channel_cfg[1].stop_button.configure(state="disabled")
+            if not any_running:
+                self.log_message("Both-channel periodic broadcast has stopped")
+        else:
+            cfg.stop_button.configure(state="disabled")
+            cfg.start_button.configure(
+                state="normal" if self.connected else "disabled"
+            )
 
     def disconnect(self):
         for cfg in self.channel_cfg.values():
