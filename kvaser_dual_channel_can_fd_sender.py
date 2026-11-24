@@ -245,7 +245,7 @@ class KvaserDualChannelSender:
 
             self.status.configure(
                 text=f"Connected: CH0 + CH1 | Nominal {nominal} bps | "
-                     f"Data {data_rate} bps | CAN FD",
+                    f"Data {data_rate} bps | CAN FD",
                 foreground="green"
             )
             self.log_message(
